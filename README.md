@@ -123,10 +123,47 @@ Requires a cgroups v2 host (Ubuntu 22.04+, Fedora, Debian 12+). Inside your Linu
 
 **macOS:** cgroup operations are stubbed — `go build ./...` still succeeds, and passing `--memory`/`--cpu`/`--pids` logs a one-line skip notice before the runtime itself errors out with the existing "requires Linux" message.
 
+## M3 Status
+
+**Shipped:** OCI image pull from Docker Hub (stdlib HTTP only, no external tools) and OverlayFS-backed container rootfs, wired into `myrun`.
+
+```
+mvp/internal/image/
+├── pull.go             # Docker Hub v2 client: token -> manifest -> layer blobs, tar+gzip extract
+└── store.go            # content-addressed blob cache + per-image extracted-layer tree
+
+mvp/internal/overlay/
+├── overlay_linux.go    # mounts lowerdir=<image layers>,upperdir,workdir -> merged rootfs
+└── overlay_darwin.go   # stub so `go build ./...` stays green on macOS
+```
+
+**Flow:**
+
+1. `myrun pull alpine:3.20` — fetch an anonymous bearer token from `auth.docker.io`, fetch the manifest (negotiating Docker v2 + OCI media types; resolves manifest lists to `linux/<GOARCH>`), stream each layer blob into `data/blobs/sha256/<hex>`, verify sha256, and untar each layer into `data/images/library/alpine/3.20/rootfs/<hex>/`. Whiteout files (`.wh.*`) are honored.
+2. `myrun run alpine:3.20 /bin/sh` — if the first positional isn't an existing directory, it is parsed as an image reference. The runtime stacks the image's layer dirs as OverlayFS `lowerdir` (topmost first), creates a fresh `upperdir` + `workdir` under `data/containers/<id>/`, mounts the `merged` dir, and passes that merged path to the child which then does the usual chroot / mount /proc / exec from M1 + cgroups from M2. On exit the overlay is unmounted and the scratch dir is removed.
+
+**CLI:**
+
+```sh
+# Pull once (works on macOS too — it's just HTTPS + tar)
+./myrun pull alpine:3.20
+
+# Run (Linux only)
+sudo ./myrun run alpine:3.20 /bin/sh
+sudo ./myrun run --memory=64M --cpu=0.5 --pids=100 alpine:3.20 /bin/sh
+
+# M1 behaviour still works: pass a directory instead of an image ref
+sudo ./myrun run ./rootfs /bin/sh
+```
+
+Override the store root with `MYRUN_STORE=/var/lib/myrun`. Default is `./data/` relative to the current working directory.
+
+**macOS:** `go build ./...` compiles the darwin stub for overlay; `myrun pull` works fine (useful for pre-fetching images from the host before SSHing into a Linux VM); `myrun run` still errors out with the existing "requires Linux" message.
+
 ## Milestones
 - **M1 (done):** PID/MNT/UTS/IPC/NET namespaces + chroot + `mount /proc` + basic `run`
 - **M2 (done):** cgroups v2 resource limits (cpu/mem/pids)
-- **M3:** OverlayFS + OCI image pull from Docker Hub
+- **M3 (done):** OverlayFS + OCI image pull from Docker Hub
 - **M4:** CNI bridge networking + port forwarding
 - **M5:** Seccomp profiles + rootless + full OCI spec compliance · USER namespace · pivot_root instead of chroot
 

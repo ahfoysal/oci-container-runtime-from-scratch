@@ -17,10 +17,11 @@ var errDarwinUnsupported = errors.New("myrun runtime requires Linux (namespaces 
 
 // Config mirrors the Linux struct so main.go needs no build-tag branches.
 type Config struct {
-	Rootfs string
-	Cmd    string
-	Args   []string
-	Limits cgroups.Limits
+	Rootfs    string
+	Cmd       string
+	Args      []string
+	Limits    cgroups.Limits
+	StoreRoot string // M3: image-store root for pulled images + container scratch.
 }
 
 // Run is a macOS stub; returns an error explaining the platform limitation.

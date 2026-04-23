@@ -2,14 +2,19 @@
 //
 // Usage:
 //
-//	myrun run [--memory=512M] [--cpu=0.5] [--pids=100] <rootfs-dir> <cmd> [args...]
+//	myrun pull <image[:tag]>
+//	myrun run [--memory=512M] [--cpu=0.5] [--pids=100] <rootfs-or-image> <cmd> [args...]
 //
-// On Linux, `run` clones a child with new PID/UTS/MNT/IPC/NET namespaces,
-// places the child in a cgroups v2 subgroup with the requested limits,
-// chroots into <rootfs-dir>, and execs <cmd>. On macOS, the runtime
-// subcommand is a stub that prints a message and exits non-zero — the binary
-// still compiles so development on macOS works, but actual execution
-// requires Linux.
+// As of M3, the rootfs argument can be either a local directory (classic
+// behaviour) or an image reference that has been pulled into the local
+// store (`data/images/...`). In the latter case the runtime stacks the
+// image layers as an OverlayFS lowerdir and creates a writable upperdir for
+// the container — so each `run` gets a fresh copy-on-write rootfs without
+// duplicating the image on disk.
+//
+// On macOS, the runtime subcommands are stubs that print a message and exit
+// non-zero — the binary still compiles so development on macOS works, but
+// actual execution requires Linux (namespaces, chroot, OverlayFS).
 package main
 
 import (
@@ -20,30 +25,53 @@ import (
 	"strings"
 
 	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/cgroups"
+	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/image"
 	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/runtime"
 )
+
+// defaultStoreRoot is the on-disk location for pulled images + container
+// scratch dirs. Override with MYRUN_STORE.
+const defaultStoreRoot = "data"
+
+func storeRoot() string {
+	if v := os.Getenv("MYRUN_STORE"); v != "" {
+		return v
+	}
+	return defaultStoreRoot
+}
 
 func usage() {
 	fmt.Fprintf(os.Stderr, `myrun — MVP OCI-style container runtime
 
 Usage:
-  myrun run [flags] <rootfs-dir> <cmd> [args...]   Run <cmd> inside a new container
-  myrun child <rootfs-dir> <cmd> [args...]         (internal) re-exec entrypoint after clone
+  myrun pull <image[:tag]>                          Download image layers from Docker Hub into %s/
+  myrun run [flags] <rootfs-or-image> <cmd> [args]  Run <cmd> inside a new container
+  myrun child <rootfs-dir> <cmd> [args...]          (internal) re-exec entrypoint after clone
 
 Flags for 'run':
   --memory=SIZE   Hard memory limit, e.g. 64M, 512M, 1G. Unset = unlimited.
   --cpu=N         CPU cores (fractional allowed), e.g. 0.5 = half a core. Unset = unlimited.
   --pids=N        Max number of PIDs in the container. Unset = unlimited.
 
+Image reference resolution for 'run':
+  If the first positional is an existing directory, it is used as the rootfs
+  (M1 behavior). Otherwise it is parsed as an image reference (e.g.
+  "alpine:3.20") and, if already pulled, mounted as an OverlayFS stack.
+
 Examples:
-  myrun run ./rootfs /bin/sh
+  myrun pull alpine:3.20
+  myrun run alpine:3.20 /bin/sh
   myrun run --memory=64M --cpu=0.5 --pids=100 ./rootfs /bin/sh
 
 Notes:
-  Requires Linux (namespaces, chroot, cgroups v2). On macOS this binary
-  compiles but the runtime subcommands will exit with an error, and cgroup
-  operations are stubbed out. Test inside a Multipass/UTM/Lima VM.
-`)
+  Requires Linux (namespaces, chroot, cgroups v2, OverlayFS). On macOS this
+  binary compiles but runtime subcommands exit with an error. 'pull' works
+  on both — image download is just HTTP — so you can pre-fetch images from
+  the host before dropping into your Linux VM.
+
+Environment:
+  MYRUN_STORE   Override the store root (default: %s/).
+`, defaultStoreRoot, defaultStoreRoot)
 }
 
 // parseMemory accepts sizes like "512", "512K", "64M", "1G" (case-insensitive,
@@ -76,8 +104,29 @@ func parseMemory(s string) (int64, error) {
 	return n * mult, nil
 }
 
+// pullCmd implements `myrun pull <ref>`.
+func pullCmd(argv []string) error {
+	if len(argv) < 1 {
+		usage()
+		return fmt.Errorf("pull requires an image reference")
+	}
+	ref, err := image.ParseRef(argv[0])
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Pulling %s from Docker Hub...\n", ref)
+	c := &image.Client{}
+	dir, err := c.Pull(ref, storeRoot())
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Pulled %s into %s\n", ref, dir)
+	return nil
+}
+
 // runCmd parses flags + positionals for the `run` subcommand and dispatches
-// into the runtime package.
+// into the runtime package. The rootfs argument may be a directory (classic)
+// or an image reference that has been pulled.
 func runCmd(argv []string) error {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -89,7 +138,7 @@ func runCmd(argv []string) error {
 	}
 	if fs.NArg() < 2 {
 		usage()
-		return fmt.Errorf("run requires <rootfs-dir> and <cmd>")
+		return fmt.Errorf("run requires <rootfs-or-image> and <cmd>")
 	}
 
 	memBytes, err := parseMemory(*memStr)
@@ -106,6 +155,7 @@ func runCmd(argv []string) error {
 			CPUQuota:    *cpu,
 			PidsMax:     *pids,
 		},
+		StoreRoot: storeRoot(),
 	}
 	return runtime.Run(cfg)
 }
@@ -117,6 +167,11 @@ func main() {
 	}
 
 	switch os.Args[1] {
+	case "pull":
+		if err := pullCmd(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "myrun: pull failed: %v\n", err)
+			os.Exit(1)
+		}
 	case "run":
 		if err := runCmd(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "myrun: run failed: %v\n", err)
@@ -125,8 +180,9 @@ func main() {
 	case "child":
 		// Internal re-exec path: this is the process that already has the new
 		// namespaces; it performs the chroot/mount setup and execs the user
-		// cmd. The parent has already placed us into a cgroup (if any) before
-		// releasing the sync pipe we block on inside Child.
+		// cmd. The parent has already placed us into a cgroup (if any) and
+		// prepared the rootfs (possibly an overlay mount) before releasing
+		// the sync pipe we block on inside Child.
 		if len(os.Args) < 4 {
 			usage()
 			os.Exit(2)

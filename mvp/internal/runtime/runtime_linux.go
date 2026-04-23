@@ -5,35 +5,107 @@
 // rootfs, mount a fresh /proc so tools like `ps` work, then exec the user's
 // command. Since M2 it also attaches the container process to a cgroups v2
 // subgroup before exec so resource limits take effect from PID 1 onwards.
+// Since M3 it resolves the rootfs argument against the local image store and
+// mounts an OverlayFS stack when the argument is an image reference rather
+// than a plain directory.
 package runtime
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"syscall"
 
 	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/cgroups"
+	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/image"
+	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/overlay"
 )
 
 // Config bundles the knobs the parent can pass to Run. Keeping this in one
 // struct lets us add more options (user ns, readonly rootfs, etc.) without
 // churning the signature on every milestone.
 type Config struct {
-	Rootfs string
-	Cmd    string
-	Args   []string
-	Limits cgroups.Limits
+	// Rootfs is either an existing directory (M1 classic mode) or an image
+	// reference previously pulled into StoreRoot (M3 overlay mode).
+	Rootfs    string
+	Cmd       string
+	Args      []string
+	Limits    cgroups.Limits
+	StoreRoot string
+}
+
+// resolveRootfs decides whether cfg.Rootfs is a plain directory or an image
+// reference. If it is a directory, we use it as-is. Otherwise we try to load
+// its manifest from the store and mount an OverlayFS stack; the caller
+// receives the merged dir and a cleanup func.
+func resolveRootfs(cfg Config) (rootfs string, cleanup func(), err error) {
+	// Plain directory takes precedence — lets users keep using the M1 flow.
+	if fi, serr := os.Stat(cfg.Rootfs); serr == nil && fi.IsDir() {
+		return cfg.Rootfs, func() {}, nil
+	}
+
+	ref, perr := image.ParseRef(cfg.Rootfs)
+	if perr != nil {
+		return "", nil, fmt.Errorf("rootfs %q is neither a directory nor a valid image ref: %w", cfg.Rootfs, perr)
+	}
+	store, serr := image.OpenStore(cfg.StoreRoot)
+	if serr != nil {
+		return "", nil, serr
+	}
+	info, lerr := store.LoadManifest(ref)
+	if lerr != nil {
+		return "", nil, fmt.Errorf("image %s not in local store — run `myrun pull %s` first: %w", ref, ref, lerr)
+	}
+
+	// Fresh per-container scratch dir under <store>/containers/<id>/.
+	id := newContainerID()
+	containerDir := filepath.Join(cfg.StoreRoot, "containers", id)
+	if err := os.MkdirAll(containerDir, 0o755); err != nil {
+		return "", nil, err
+	}
+
+	mnt, merr := overlay.MountOverlay(info.OverlayLowerDirs(), containerDir)
+	if merr != nil {
+		os.RemoveAll(containerDir)
+		return "", nil, merr
+	}
+
+	cleanup = func() {
+		if err := mnt.Unmount(); err != nil {
+			log.Printf("overlay: unmount: %v", err)
+		}
+		if err := mnt.Cleanup(); err != nil {
+			log.Printf("overlay: cleanup: %v", err)
+		}
+	}
+	return mnt.Merged, cleanup, nil
+}
+
+// newContainerID returns a short random hex id for the container scratch dir.
+func newContainerID() string {
+	var b [6]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
 }
 
 // Run is the parent-side entrypoint invoked by `myrun run ...`. It:
-//  1. starts /proc/self/exe child inside new namespaces (paused on a sync pipe)
-//  2. creates a cgroup keyed on the child PID and writes the requested limits
-//  3. adds the child PID to cgroup.procs
-//  4. closes the sync pipe so the child continues into chroot + exec
-//  5. waits for the child, then removes the cgroup
+//  1. resolves the rootfs (plain dir, or image ref -> OverlayFS merged dir)
+//  2. starts /proc/self/exe child inside new namespaces (paused on a sync pipe)
+//  3. creates a cgroup keyed on the child PID and writes the requested limits
+//  4. adds the child PID to cgroup.procs
+//  5. closes the sync pipe so the child continues into chroot + exec
+//  6. waits for the child, then removes the cgroup and overlay mount
 func Run(cfg Config) error {
+	rootfs, cleanupRootfs, err := resolveRootfs(cfg)
+	if err != nil {
+		return err
+	}
+	defer cleanupRootfs()
+
 	// syncPipe: parent keeps the write end; child reads from fd 3. The child
 	// blocks on a read until the parent closes the pipe — that happens only
 	// after the cgroup is fully set up with the child already inside it.
@@ -43,7 +115,7 @@ func Run(cfg Config) error {
 	}
 	defer w.Close()
 
-	selfArgs := append([]string{"child", cfg.Rootfs, cfg.Cmd}, cfg.Args...)
+	selfArgs := append([]string{"child", rootfs, cfg.Cmd}, cfg.Args...)
 	c := exec.Command("/proc/self/exe", selfArgs...)
 	c.Stdin = os.Stdin
 	c.Stdout = os.Stdout
@@ -135,7 +207,9 @@ func Child(rootfs, cmd string, args []string) error {
 		return fmt.Errorf("chdir /: %w", err)
 	}
 
-	// /proc must exist inside the rootfs for this to succeed.
+	// /proc must exist inside the rootfs for this to succeed. Image-pulled
+	// rootfs already ships /proc as an empty dir; for manually-prepared
+	// rootfs dirs the user is expected to create it.
 	if err := syscall.Mount("proc", "/proc", "proc", 0, ""); err != nil {
 		return fmt.Errorf("mount /proc: %w", err)
 	}
