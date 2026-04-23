@@ -7,12 +7,24 @@
 // must happen inside a Linux VM (Multipass, UTM, Lima, Docker Desktop VM).
 package runtime
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/cgroups"
+)
 
 var errDarwinUnsupported = errors.New("myrun runtime requires Linux (namespaces + chroot). Run inside a Linux VM — see mvp/README")
 
+// Config mirrors the Linux struct so main.go needs no build-tag branches.
+type Config struct {
+	Rootfs string
+	Cmd    string
+	Args   []string
+	Limits cgroups.Limits
+}
+
 // Run is a macOS stub; returns an error explaining the platform limitation.
-func Run(rootfs, cmd string, args []string) error {
+func Run(cfg Config) error {
 	return errDarwinUnsupported
 }
 
