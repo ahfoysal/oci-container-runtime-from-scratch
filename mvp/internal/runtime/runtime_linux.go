@@ -22,6 +22,7 @@ import (
 
 	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/cgroups"
 	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/image"
+	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/network"
 	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/overlay"
 )
 
@@ -36,6 +37,10 @@ type Config struct {
 	Args      []string
 	Limits    cgroups.Limits
 	StoreRoot string
+	// PortMappings lists --publish host:container entries. Empty means no
+	// DNAT rules are installed; the container still gets a bridge IP and
+	// outbound connectivity via MASQUERADE.
+	PortMappings []network.PortMapping
 }
 
 // resolveRootfs decides whether cfg.Rootfs is a plain directory or an image
@@ -106,6 +111,11 @@ func Run(cfg Config) error {
 	}
 	defer cleanupRootfs()
 
+	// Container id is used to name veth interfaces + tag iptables rules so
+	// teardown can find them. We generate fresh every run even in classic
+	// M1 mode where the rootfs is a plain directory.
+	containerID := newContainerID()
+
 	// syncPipe: parent keeps the write end; child reads from fd 3. The child
 	// blocks on a read until the parent closes the pipe — that happens only
 	// after the cgroup is fully set up with the child already inside it.
@@ -156,8 +166,31 @@ func Run(cfg Config) error {
 		}
 	}
 
+	// M4: network setup. The child was cloned with CLONE_NEWNET so it
+	// already has its own netns; we create a veth pair, attach the host
+	// side to the `myrun0` bridge, move the peer into the child's netns
+	// (addressable as /proc/<pid>/ns/net via `ip link set ... netns <pid>`),
+	// and configure the peer's IP/route from the parent using `ip -n`.
+	// After this, when the child proceeds past the sync pipe, its netns
+	// already has eth0 up with a live default route.
+	netCfg := network.Config{
+		ContainerID:  containerID,
+		ChildPID:     c.Process.Pid,
+		Rootfs:       rootfs,
+		PortMappings: cfg.PortMappings,
+	}
+	netHandle, nerr := network.Setup(netCfg)
+	if nerr != nil {
+		_ = c.Process.Kill()
+		_, _ = c.Process.Wait()
+		if cg != nil {
+			_ = cg.Close()
+		}
+		return fmt.Errorf("network setup: %w", nerr)
+	}
+
 	// Release the child — it will now chroot and exec the user command
-	// from inside the cgroup.
+	// from inside the cgroup with a live network interface already present.
 	w.Close()
 
 	waitErr := c.Wait()
@@ -167,6 +200,16 @@ func Run(cfg Config) error {
 	if cg != nil {
 		if cerr := cg.Close(); cerr != nil {
 			log.Printf("cgroups: cleanup: %v", cerr)
+		}
+	}
+
+	// Tear down the network regardless of exit status. The host veth is
+	// deleted (which also removes the peer) and all iptables rules we
+	// tagged with this container's id are removed. We leave the `myrun0`
+	// bridge in place so subsequent runs can reuse it.
+	if netHandle != nil {
+		if nerr := netHandle.Teardown(netCfg); nerr != nil {
+			log.Printf("network: teardown: %v", nerr)
 		}
 	}
 

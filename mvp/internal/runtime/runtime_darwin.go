@@ -11,6 +11,7 @@ import (
 	"errors"
 
 	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/cgroups"
+	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/network"
 )
 
 var errDarwinUnsupported = errors.New("myrun runtime requires Linux (namespaces + chroot). Run inside a Linux VM — see mvp/README")
@@ -22,6 +23,9 @@ type Config struct {
 	Args      []string
 	Limits    cgroups.Limits
 	StoreRoot string // M3: image-store root for pulled images + container scratch.
+	// PortMappings mirrors the Linux field so main.go doesn't need build tags.
+	// macOS never consumes this — Run returns errDarwinUnsupported first.
+	PortMappings []network.PortMapping
 }
 
 // Run is a macOS stub; returns an error explaining the platform limitation.

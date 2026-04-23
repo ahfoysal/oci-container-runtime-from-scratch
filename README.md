@@ -160,11 +160,89 @@ Override the store root with `MYRUN_STORE=/var/lib/myrun`. Default is `./data/` 
 
 **macOS:** `go build ./...` compiles the darwin stub for overlay; `myrun pull` works fine (useful for pre-fetching images from the host before SSHing into a Linux VM); `myrun run` still errors out with the existing "requires Linux" message.
 
+## M4 Status
+
+**Shipped:** Linux bridge networking, per-container veth pair, outbound NAT, and `--publish` port forwarding via iptables DNAT — no CNI plugins, stdlib-only Go, shells out to `ip` and `iptables`.
+
+```
+mvp/internal/network/
+├── bridge_linux.go     # myrun0 bridge, veth pair, netns IP/route, iptables DNAT + MASQUERADE
+└── network_darwin.go   # stub so `go build ./...` stays green on macOS
+```
+
+**Flow** (Linux):
+
+1. **Bridge:** first container lazily creates `myrun0` (`ip link add ... type bridge`), assigns it `10.44.0.1/24`, brings it up, enables `ip_forward`, installs a `MASQUERADE` rule for `10.44.0.0/24 ! -o myrun0` and opens `FORWARD` both directions on the bridge. Subsequent runs reuse the bridge.
+2. **Per-container:** parent creates a veth pair `vm<id>` / `vc<id>`, attaches host side to `myrun0`, and moves the peer into the child's netns (`ip link set <peer> netns <child-pid>`). Then, still from the parent but targeting the child's netns via `ip -n <pid>`: rename peer to `eth0`, bring `lo` up, assign `10.44.0.X/24` (deterministic `sha1(container-id) → .2-.254`), bring `eth0` up, add `default via 10.44.0.1`. A minimal `/etc/resolv.conf` (8.8.8.8, 1.1.1.1) is written into the rootfs so DNS works.
+3. **Port forwarding (`--publish host:container[/proto]`, repeatable):** parent installs DNAT rules in `nat/PREROUTING` and `nat/OUTPUT` to rewrite the destination to `<container-ip>:<container-port>`, plus a matching `FORWARD ACCEPT`. Each rule carries `-m comment --comment myrun:<id>` so teardown can delete exactly its own rules.
+4. **Teardown:** deletes the host-side veth (which also evicts the peer in the now-gone netns) and removes all iptables rules tagged with the container id. The `myrun0` bridge is intentionally left in place.
+
+The child doesn't need any new code — by the time the parent closes the sync pipe, `eth0` is already up inside the netns, and the child chroots/execs as before.
+
+**CLI:**
+
+```sh
+sudo ./myrun run alpine:3.20 /bin/sh
+sudo ./myrun run --publish 8080:80 alpine:3.20 /bin/sh
+sudo ./myrun run --publish 8080:80 --publish 8443:443/tcp alpine:3.20 /bin/sh
+sudo ./myrun run --memory=64M --cpu=0.5 --publish 8080:80 alpine:3.20 /bin/sh
+```
+
+### Linux test recipe
+
+Requires `iproute2` (`ip`) and `iptables` on the host (both default on Ubuntu 22.04+). Inside your Linux VM:
+
+1. Build and pull an image that ships `nc` or `httpd`:
+   ```sh
+   cd mvp
+   go build -o myrun ./cmd/myrun
+   sudo ./myrun pull alpine:3.20
+   ```
+
+2. **Outbound + DNS:** run a shell and hit the bridge, gateway, and the public internet:
+   ```sh
+   sudo ./myrun run alpine:3.20 /bin/sh
+   # inside container:
+   ip addr show eth0          # 10.44.0.X/24
+   ip route                   # default via 10.44.0.1
+   ping -c 2 10.44.0.1        # the myrun0 bridge
+   ping -c 2 8.8.8.8          # outbound via MASQUERADE
+   nslookup google.com        # resolv.conf → 8.8.8.8 works
+   ```
+
+3. **Port forwarding:** publish 8080 → 80 and curl it from the host:
+   ```sh
+   # terminal 1 — start a tiny HTTP listener inside the container:
+   sudo ./myrun run --publish 8080:80 alpine:3.20 \
+     /bin/sh -c 'apk add --no-cache busybox-extras >/dev/null; httpd -f -p 80 -h /'
+
+   # terminal 2 — hit it from the host:
+   curl -v http://127.0.0.1:8080/
+   curl -v http://<vm-ip>:8080/     # works from outside the VM too
+   ```
+
+4. **Verify the rules while the container runs:**
+   ```sh
+   ip link show myrun0                 # bridge, state UP
+   ip -br link | grep '^vm'            # host-side veth, master myrun0
+   sudo iptables -t nat -S PREROUTING | grep myrun
+   sudo iptables -t nat -S POSTROUTING | grep 10.44.0
+   ```
+
+5. **After the container exits:** the host veth disappears and the DNAT rules are gone. The `myrun0` bridge is left in place for the next run:
+   ```sh
+   ip link show myrun0                 # still present
+   ip -br link | grep '^vm'            # nothing
+   sudo iptables -t nat -S | grep myrun    # nothing
+   ```
+
+**macOS:** `go build ./...` compiles the darwin stub; `myrun run` still errors out with the existing "requires Linux" message.
+
 ## Milestones
 - **M1 (done):** PID/MNT/UTS/IPC/NET namespaces + chroot + `mount /proc` + basic `run`
 - **M2 (done):** cgroups v2 resource limits (cpu/mem/pids)
 - **M3 (done):** OverlayFS + OCI image pull from Docker Hub
-- **M4:** CNI bridge networking + port forwarding
+- **M4 (done):** Bridge networking (`myrun0`) + veth pairs + iptables DNAT port forwarding
 - **M5:** Seccomp profiles + rootless + full OCI spec compliance · USER namespace · pivot_root instead of chroot
 
 ## Key References

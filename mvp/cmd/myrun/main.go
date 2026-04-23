@@ -26,6 +26,7 @@ import (
 
 	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/cgroups"
 	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/image"
+	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/network"
 	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/runtime"
 )
 
@@ -49,9 +50,10 @@ Usage:
   myrun child <rootfs-dir> <cmd> [args...]          (internal) re-exec entrypoint after clone
 
 Flags for 'run':
-  --memory=SIZE   Hard memory limit, e.g. 64M, 512M, 1G. Unset = unlimited.
-  --cpu=N         CPU cores (fractional allowed), e.g. 0.5 = half a core. Unset = unlimited.
-  --pids=N        Max number of PIDs in the container. Unset = unlimited.
+  --memory=SIZE            Hard memory limit, e.g. 64M, 512M, 1G. Unset = unlimited.
+  --cpu=N                  CPU cores (fractional allowed), e.g. 0.5 = half a core. Unset = unlimited.
+  --pids=N                 Max number of PIDs in the container. Unset = unlimited.
+  --publish=H:C[/proto]    Forward host port H to container port C (tcp default). Repeatable.
 
 Image reference resolution for 'run':
   If the first positional is an existing directory, it is used as the rootfs
@@ -72,6 +74,58 @@ Notes:
 Environment:
   MYRUN_STORE   Override the store root (default: %s/).
 `, defaultStoreRoot, defaultStoreRoot)
+}
+
+// publishFlag collects repeated --publish host:container[/proto] values.
+// Implementing flag.Value lets us accept the flag multiple times on the
+// command line (e.g. `--publish 8080:80 --publish 8443:443`).
+type publishFlag []network.PortMapping
+
+func (p *publishFlag) String() string {
+	if p == nil || len(*p) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(*p))
+	for _, pm := range *p {
+		parts = append(parts, fmt.Sprintf("%d:%d/%s", pm.HostPort, pm.ContainerPort, pm.Protocol))
+	}
+	return strings.Join(parts, ",")
+}
+
+// Set parses one --publish value of the form `host:container` or
+// `host:container/proto` and appends it to the list.
+func (p *publishFlag) Set(v string) error {
+	pm, err := parsePublish(v)
+	if err != nil {
+		return err
+	}
+	*p = append(*p, pm)
+	return nil
+}
+
+// parsePublish parses `host:container[/proto]` into a PortMapping. proto
+// defaults to tcp. We deliberately keep this tiny — no interface binding,
+// no ranges, no IPv6 — to match the M4 scope.
+func parsePublish(s string) (network.PortMapping, error) {
+	spec := s
+	proto := "tcp"
+	if i := strings.IndexByte(spec, '/'); i >= 0 {
+		proto = strings.ToLower(spec[i+1:])
+		spec = spec[:i]
+	}
+	if proto != "tcp" && proto != "udp" {
+		return network.PortMapping{}, fmt.Errorf("publish %q: protocol must be tcp or udp", s)
+	}
+	parts := strings.SplitN(spec, ":", 2)
+	if len(parts) != 2 {
+		return network.PortMapping{}, fmt.Errorf("publish %q: expected host:container[/proto]", s)
+	}
+	host, herr := strconv.Atoi(parts[0])
+	cont, cerr := strconv.Atoi(parts[1])
+	if herr != nil || cerr != nil || host <= 0 || host > 65535 || cont <= 0 || cont > 65535 {
+		return network.PortMapping{}, fmt.Errorf("publish %q: invalid port numbers", s)
+	}
+	return network.PortMapping{HostPort: host, ContainerPort: cont, Protocol: proto}, nil
 }
 
 // parseMemory accepts sizes like "512", "512K", "64M", "1G" (case-insensitive,
@@ -133,6 +187,8 @@ func runCmd(argv []string) error {
 	memStr := fs.String("memory", "", "memory limit (e.g. 64M, 512M, 1G)")
 	cpu := fs.Float64("cpu", 0, "CPU cores (fractional, e.g. 0.5)")
 	pids := fs.Int64("pids", 0, "max PIDs in container")
+	var publish publishFlag
+	fs.Var(&publish, "publish", "publish host:container[/proto] (repeatable)")
 	if err := fs.Parse(argv); err != nil {
 		return err
 	}
@@ -155,7 +211,8 @@ func runCmd(argv []string) error {
 			CPUQuota:    *cpu,
 			PidsMax:     *pids,
 		},
-		StoreRoot: storeRoot(),
+		StoreRoot:    storeRoot(),
+		PortMappings: []network.PortMapping(publish),
 	}
 	return runtime.Run(cfg)
 }
