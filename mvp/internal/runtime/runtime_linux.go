@@ -25,7 +25,9 @@ import (
 	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/network"
 	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/ocispec"
 	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/overlay"
+	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/pivot"
 	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/seccomp"
+	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/slirp"
 	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/userns"
 )
 
@@ -289,6 +291,7 @@ func Run(cfg Config) error {
 	// outbound connectivity.
 	var netHandle *network.Network
 	var netCfg network.Config
+	var slirpHandle *slirp.Handle
 	if !cfg.Rootless.Enabled {
 		netCfg = network.Config{
 			ContainerID:  containerID,
@@ -307,7 +310,20 @@ func Run(cfg Config) error {
 			return fmt.Errorf("network setup: %w", nerr)
 		}
 	} else {
-		log.Printf("rootless: skipping bridge/veth setup (host-root only); container has lo only")
+		// M6: rootless containers get a userspace NAT via slirp4netns.
+		// We spawn it now — after the child exists (so /proc/<pid>/ns/net
+		// is resolvable) but before we close the sync pipe (so the TAP
+		// device is guaranteed present by the time the child execs).
+		// If slirp4netns isn't installed we fall back to loopback-only
+		// and print the install hint rather than aborting: preserves
+		// the M5 behaviour for users who deliberately want no network.
+		sh, serr := slirp.Setup(slirp.Config{ChildPID: c.Process.Pid, Rootfs: rootfs})
+		if serr != nil {
+			log.Printf("rootless: slirp4netns unavailable (%v); container will have lo only", serr)
+		} else {
+			slirpHandle = sh
+			log.Printf("rootless: slirp4netns attached — container IP %s via %s", slirp.ContainerIP, slirp.TAPDevice)
+		}
 	}
 
 	// Release the child — it will now chroot and exec the user command
@@ -331,6 +347,12 @@ func Run(cfg Config) error {
 	if netHandle != nil {
 		if nerr := netHandle.Teardown(netCfg); nerr != nil {
 			log.Printf("network: teardown: %v", nerr)
+		}
+	}
+	// M6: reap the slirp4netns subprocess. No-op if we didn't start one.
+	if slirpHandle != nil {
+		if serr := slirpHandle.Teardown(); serr != nil {
+			log.Printf("slirp: teardown: %v", serr)
 		}
 	}
 
@@ -362,26 +384,16 @@ func Child(rootfs, cmd string, args []string, seccompEnabled bool) error {
 		return fmt.Errorf("sethostname: %w", err)
 	}
 
-	// Make mount propagation private so our mounts inside the container
-	// don't leak to the host (and vice versa).
-	if err := syscall.Mount("", "/", "", syscall.MS_PRIVATE|syscall.MS_REC, ""); err != nil {
-		return fmt.Errorf("make-rprivate /: %w", err)
-	}
-
-	if err := syscall.Chroot(rootfs); err != nil {
-		return fmt.Errorf("chroot %q: %w", rootfs, err)
-	}
-	if err := os.Chdir("/"); err != nil {
-		return fmt.Errorf("chdir /: %w", err)
-	}
-
-	// /proc must exist inside the rootfs for this to succeed. Image-pulled
-	// rootfs already ships /proc as an empty dir; for manually-prepared
-	// rootfs dirs the user is expected to create it.
-	if err := syscall.Mount("proc", "/proc", "proc", 0, ""); err != nil {
-		return fmt.Errorf("mount /proc: %w", err)
+	// M6: pivot_root replaces the M1 chroot. pivot.Do handles the full
+	// sequence (rprivate /, bind newroot, mkdir .pivot_old, pivot_root,
+	// chroot("."), umount old root, mount /proc). After it returns, the
+	// host's filesystem is structurally unreachable from this netns/mntns.
+	if err := pivot.Do(rootfs); err != nil {
+		return fmt.Errorf("pivot_root: %w", err)
 	}
 	defer func() {
+		// pivot.Do already mounted /proc; unmount on exit so the host's
+		// cleanup isn't left holding a mount inside a dead namespace.
 		_ = syscall.Unmount("/proc", 0)
 	}()
 
