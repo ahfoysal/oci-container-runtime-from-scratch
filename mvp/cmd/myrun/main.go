@@ -25,6 +25,7 @@ import (
 	"strings"
 
 	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/cgroups"
+	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/criu"
 	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/image"
 	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/network"
 	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/ocispec"
@@ -49,6 +50,8 @@ func usage() {
 Usage:
   myrun pull <image[:tag]>                          Download image layers from Docker Hub into %s/
   myrun run [flags] <rootfs-or-image> <cmd> [args]  Run <cmd> inside a new container
+  myrun checkpoint <pid> <images-dir>               (M6) CRIU dump the container rooted at <pid>
+  myrun restore <images-dir>                        (M6) CRIU restore a previously checkpointed container
   myrun child <rootfs-dir> <cmd> [args...]          (internal) re-exec entrypoint after clone
 
 Flags for 'run':
@@ -160,6 +163,41 @@ func parseMemory(s string) (int64, error) {
 	return n * mult, nil
 }
 
+// checkpointCmd implements `myrun checkpoint <pid> <images-dir>`.
+// The PID is the host-side PID of the container's PID-1 (shown by `ps`
+// or by the log line `myrun` prints on start in a future milestone).
+// imagesDir is created if missing.
+func checkpointCmd(argv []string) error {
+	if len(argv) < 2 {
+		return fmt.Errorf("checkpoint requires <pid> <images-dir>")
+	}
+	pid, err := strconv.Atoi(argv[0])
+	if err != nil || pid <= 0 {
+		return fmt.Errorf("checkpoint: invalid pid %q", argv[0])
+	}
+	if !criu.Available() {
+		return fmt.Errorf("checkpoint: criu binary not found on PATH — install the `criu` package")
+	}
+	fmt.Printf("Checkpointing pid %d into %s ...\n", pid, argv[1])
+	if err := criu.Dump(pid, argv[1]); err != nil {
+		return err
+	}
+	fmt.Printf("Checkpoint complete: %s\n", argv[1])
+	return nil
+}
+
+// restoreCmd implements `myrun restore <images-dir>`.
+func restoreCmd(argv []string) error {
+	if len(argv) < 1 {
+		return fmt.Errorf("restore requires <images-dir>")
+	}
+	if !criu.Available() {
+		return fmt.Errorf("restore: criu binary not found on PATH — install the `criu` package")
+	}
+	fmt.Printf("Restoring from %s ...\n", argv[0])
+	return criu.Restore(argv[0])
+}
+
 // pullCmd implements `myrun pull <ref>`.
 func pullCmd(argv []string) error {
 	if len(argv) < 1 {
@@ -267,6 +305,25 @@ func main() {
 	case "run":
 		if err := runCmd(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "myrun: run failed: %v\n", err)
+			os.Exit(1)
+		}
+	case "checkpoint":
+		// myrun checkpoint <pid> <images-dir>
+		// M6: shells out to `criu dump`. We take a PID rather than a
+		// container-id because this runtime doesn't yet track live
+		// containers in a state dir — the user supplies the host-side
+		// PID shown by `ps`. A future milestone could add an id->pid
+		// registry and accept `myrun checkpoint <container-id>`.
+		if err := checkpointCmd(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "myrun: checkpoint failed: %v\n", err)
+			os.Exit(1)
+		}
+	case "restore":
+		// myrun restore <images-dir>
+		// M6: shells out to `criu restore`. Runs the restored process
+		// tree in the foreground and exits with its status.
+		if err := restoreCmd(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "myrun: restore failed: %v\n", err)
 			os.Exit(1)
 		}
 	case "child":

@@ -329,13 +329,98 @@ sudo ./myrun run --no-seccomp alpine:3.20 /bin/sh
 
 **macOS:** `go build ./...` compiles the darwin stubs for seccomp + userns + ocispec. Parsing a config.json works on macOS too — execution still errors out with the existing "requires Linux" message.
 
+## M6 Status
+
+**Shipped:** `pivot_root(2)` replacing `chroot(2)` in the container entrypoint, slirp4netns-backed outbound networking for rootless mode, and CRIU-driven checkpoint/restore subcommands.
+
+```
+mvp/internal/pivot/
+├── pivot_linux.go     # rprivate / -> bind newroot -> mkdir .pivot_old -> pivot_root -> chroot(".") -> umount old -> mount /proc
+└── pivot_darwin.go    # stub
+
+mvp/internal/slirp/
+├── slirp_linux.go     # spawns slirp4netns, waits on --ready-fd, teardown via SIGTERM
+└── slirp_darwin.go    # stub
+
+mvp/internal/criu/
+├── criu_linux.go      # shells `criu dump` / `criu restore` with shell-job + tcp-established + link-remap
+└── criu_darwin.go     # stub
+```
+
+### What M6 changes
+
+- **pivot_root replaces chroot.** The child process no longer calls `syscall.Chroot` directly. `pivot.Do` performs the full runc-style sequence: make `/` rprivate+recursive, bind-mount the newroot onto itself (so it becomes a mount point distinct from the current root), `mkdir .pivot_old`, `chdir(newroot)`, `pivot_root(".", ".pivot_old")`, `chroot(".")` as belt-and-braces, `umount("/.pivot_old", MNT_DETACH)`, `rmdir /.pivot_old`, then `mount proc /proc`. After this the host filesystem is structurally unreachable — the `double-chroot ../..` and `fchdir` escapes that work against plain chroot cannot produce a valid path to the old root because the mount namespace no longer contains one.
+- **slirp4netns powers rootless networking.** M5 left rootless containers with loopback only. M6 spawns `slirp4netns` as a host-side subprocess pointed at the child's `/proc/<pid>/ns/net`, with `--configure --mtu=65520 --disable-host-loopback --ready-fd=3`. The runtime blocks on the ready pipe until libslirp has a `tap0` device configured inside the netns (10.0.2.100, gw 10.0.2.2, DNS stub 10.0.2.3), then closes the sync pipe so the child execs into a fully-networked environment. Teardown SIGTERMs slirp4netns with a 2s SIGKILL fallback. If the binary isn't installed we fall back to the M5 loopback-only behaviour with a pointer to `apt/dnf/pacman install slirp4netns` — consistent with `podman rootless` / `rootlesskit`.
+- **CRIU checkpoint/restore.** Two new subcommands. `myrun checkpoint <pid> <images-dir>` shells `criu dump --tree <pid> --images-dir <dir> --shell-job --tcp-established --file-locks --link-remap --manage-cgroups=soft`; `myrun restore <images-dir>` mirrors the flags for `criu restore`. `dump.log` / `restore.log` land in the images dir next to the `*.img` files so failures (missing kernel feature, unsupported fd, seccomp blocking ptrace) are diagnosable. We shell out rather than link libcriu to keep the dependency surface stdlib-only Go + a runtime prerequisite — the same pattern runc, podman, and containerd used for years before CRIU's RPC mode matured.
+
+### Host prerequisites
+
+- **pivot_root:** none beyond what M1 already needed.
+- **slirp4netns:** `apt install slirp4netns` / `dnf install slirp4netns` / `pacman -S slirp4netns`. Standard on Ubuntu 22.04+ as a podman dependency.
+- **CRIU:** `apt install criu` / `dnf install criu`. Kernel must have `CONFIG_CHECKPOINT_RESTORE=y` (every mainstream distro). The caller needs `CAP_SYS_ADMIN` or `CAP_CHECKPOINT_RESTORE` — run as root for the toy.
+
+### CLI
+
+```sh
+# Rootless with real outbound connectivity (slirp4netns on host required)
+./myrun run --rootless alpine:3.20 /bin/sh
+# inside container: wget https://example.com now works via 10.0.2.100/tap0
+
+# Checkpoint a running container. Find its PID with `ps -ef | grep myrun child`.
+sudo ./myrun checkpoint 12345 /tmp/ckpt
+
+# Resume the checkpointed process tree. Blocks until it exits.
+sudo ./myrun restore /tmp/ckpt
+```
+
+### Linux verification recipes
+
+1. **pivot_root escape-resistance** — in M1 a process with a lingering fd above the chroot could climb out via `fchdir`. After M6, the old root is gone from the mount namespace entirely:
+
+   ```sh
+   sudo ./myrun run alpine:3.20 /bin/sh
+   # inside container:
+   cat /proc/self/mountinfo | head    # only rootfs + /proc, no /.pivot_old
+   ls /.pivot_old                     # "No such file or directory"
+   # host's /etc is unreachable no matter how many ../.. you type.
+   ```
+
+2. **Rootless + slirp4netns outbound works** (needs `kernel.unprivileged_userns_clone=1` + slirp4netns on PATH):
+
+   ```sh
+   ./myrun run --rootless alpine:3.20 /bin/sh
+   # inside container:
+   ip addr show tap0                  # 10.0.2.100/24
+   ip route                           # default via 10.0.2.2
+   cat /etc/resolv.conf               # nameserver 10.0.2.3
+   wget -qO- https://example.com      # traverses libslirp -> host
+   ```
+
+3. **CRIU round-trip** (requires criu >= 3.15, run as root):
+
+   ```sh
+   # terminal 1 — start a long-running counter inside a container:
+   sudo ./myrun run alpine:3.20 /bin/sh -c 'i=0; while true; do echo $i; i=$((i+1)); sleep 1; done'
+
+   # terminal 2 — snapshot it by the container PID-1:
+   PID=$(pgrep -f 'myrun child' | head -n1)
+   sudo ./myrun checkpoint "$PID" /tmp/ckpt
+   ls /tmp/ckpt                        # pages-*.img, core-*.img, dump.log ...
+
+   # terminal 3 — resume; the counter continues from where it stopped:
+   sudo ./myrun restore /tmp/ckpt
+   ```
+
+**macOS:** `go build ./...` compiles the darwin stubs for pivot/slirp/criu. The `checkpoint` and `restore` subcommands still parse their args on macOS and then exit with a clear "requires Linux" / "criu not found" message before any syscall happens.
+
 ## Milestones
 - **M1 (done):** PID/MNT/UTS/IPC/NET namespaces + chroot + `mount /proc` + basic `run`
 - **M2 (done):** cgroups v2 resource limits (cpu/mem/pids)
 - **M3 (done):** OverlayFS + OCI image pull from Docker Hub
 - **M4 (done):** Bridge networking (`myrun0`) + veth pairs + iptables DNAT port forwarding
 - **M5 (done):** Seccomp BPF default profile + rootless user namespaces + OCI runtime spec (`--spec config.json`)
-- **M6 (future):** pivot_root, slirp4netns for rootless networking, CRIU checkpoint/restore, AppArmor profiles
+- **M6 (done):** `pivot_root` in place of `chroot`, slirp4netns for rootless outbound networking, CRIU checkpoint/restore
+- **M7 (future):** AppArmor profiles, containerd-shim-compatible lifecycle, CRI plug, registry auth beyond anonymous Docker Hub
 
 ## Key References
 - OCI Runtime Spec
