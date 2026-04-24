@@ -238,12 +238,104 @@ Requires `iproute2` (`ip`) and `iptables` on the host (both default on Ubuntu 22
 
 **macOS:** `go build ./...` compiles the darwin stub; `myrun run` still errors out with the existing "requires Linux" message.
 
+## M5 Status
+
+**Shipped:** default seccomp BPF profile, rootless (user-namespace) mode, and partial OCI runtime spec compliance — `myrun run --spec config.json` now works for the subset of the spec the runtime can honour.
+
+```
+mvp/internal/seccomp/
+├── seccomp_linux.go        # hand-rolled cBPF filter, PR_SET_NO_NEW_PRIVS + SECCOMP_SET_MODE_FILTER + TSYNC
+├── allowlist_amd64.go      # x86_64 syscall numbers (mirrors Docker default profile)
+├── allowlist_arm64.go      # aarch64 syscall numbers
+└── seccomp_darwin.go       # stub
+
+mvp/internal/userns/
+├── userns_linux.go         # CLONE_NEWUSER, uid/gid maps, setgroups=deny, sysctl preflight
+└── userns_darwin.go        # stub
+
+mvp/internal/ocispec/
+├── spec.go                 # parser for ociVersion/process/root/mounts/linux.*
+├── spec_test.go
+└── testdata/
+    ├── config.json            # sample spec (memory 64M, cpu 0.5, pids 100, default seccomp)
+    └── config_rootless.json   # sample spec with linux.namespaces[user] + uid/gid maps
+```
+
+### What M5 enforces
+
+- **Seccomp BPF (default on, `--no-seccomp` to disable).** The child installs the filter on every thread via `SECCOMP_FILTER_FLAG_TSYNC` right before `execve`. The program is a single ld-arch-check + unrolled JEQ cascade that kills the process on any syscall outside the allow list. Dangerous syscalls explicitly excluded on x86_64: `ptrace`, `mount`, `umount2`, `kexec_load`, `kexec_file_load`, `reboot`, `init_module`, `finit_module`, `delete_module`, `iopl`, `ioperm`, `swapon`, `swapoff`, `settimeofday`, `clock_settime`, `create_module`, `query_module`, `get_kernel_syms`, `nfsservctl`, `lookup_dcookie`, `perf_event_open`, `bpf`, `userfaultfd`, `mbind`, `move_pages`, `set_mempolicy`, `get_mempolicy`, `acct`, `add_key`, `request_key`, `keyctl`.
+- **Rootless mode (`--rootless`, auto-enabled when invoked as non-root).** Adds `CLONE_NEWUSER`, sets uid/gid maps to `0 → <real-uid> 1`, disables `setgroups` so the mapping is legal without `CAP_SETGID` in the parent, and the runtime skips cgroups + bridge networking because those need real root. Container comes up with only `lo` and inherits the host's network via the user ns — good enough to prove isolation works; slirp4netns integration is a future milestone.
+- **OCI runtime spec (`--spec config.json`).** The spec is folded into `runtime.Config` before Run proceeds; CLI flags that were explicitly set win over spec values. Supported fields: `ociVersion`, `process.{args,env,cwd,user,noNewPrivileges,capabilities}` (args/cwd honoured; rest surfaced), `root.{path,readonly}`, `hostname`, `mounts` (parsed, partial consumption — /proc still always bind-mounted), `linux.namespaces` (type=user triggers rootless), `linux.{uidMappings,gidMappings}`, `linux.resources.{memory.limit, cpu.{quota,period}, pids.limit}`, `linux.seccomp` (any non-nil value turns on our default profile — per-syscall rule translation is intentionally omitted).
+
+### CLI
+
+```sh
+# Seccomp (default on)
+sudo ./myrun run alpine:3.20 /bin/sh
+
+# Disable seccomp for debugging
+sudo ./myrun run --no-seccomp alpine:3.20 /bin/sh
+
+# Rootless (no sudo)
+./myrun run --rootless alpine:3.20 /bin/sh
+
+# OCI spec drive
+./myrun run --spec mvp/internal/ocispec/testdata/config.json
+```
+
+### Linux verification recipes
+
+1. **Seccomp hard-deny works** — inside the container, calling a blocked syscall should kill the process:
+
+   ```sh
+   sudo ./myrun run alpine:3.20 /bin/sh
+   # inside container — mount() is not in the allow list:
+   mount -t tmpfs tmpfs /mnt 2>/dev/null ; echo exit=$?   # shell dies with "Bad system call"
+   ```
+
+   Confirm on the host:
+   ```sh
+   dmesg | tail   # "audit: type=1326 ... comm=\"sh\" ... syscall=165 ... code=0x80000000"
+   ```
+
+   With `--no-seccomp` the same `mount` call returns `EPERM` or `EACCES` instead of killing the shell — use that to prove the filter is what's enforcing, not the caps.
+
+2. **Rootless works without sudo** (requires `sysctl kernel.unprivileged_userns_clone=1`):
+
+   ```sh
+   ./myrun run --rootless alpine:3.20 /bin/sh
+   # inside:
+   id           # uid=0(root) gid=0(root)
+   cat /proc/self/uid_map   # "0 <your-host-uid> 1"
+   ip link      # only lo — by design, rootless has no bridge
+   ```
+
+   On the host, the container process actually runs as your user:
+   ```sh
+   ps -eo pid,user,comm | grep myrun    # user is YOU, not root
+   ```
+
+3. **OCI spec** — `--spec` drives rootfs + command + limits from config.json:
+
+   ```sh
+   # Prepare a rootfs dir next to the config, or edit root.path to point at one.
+   cp -r /path/to/alpine-rootfs mvp/internal/ocispec/testdata/rootfs
+   sudo ./myrun run --spec mvp/internal/ocispec/testdata/config.json
+   # limits applied: verify in another shell
+   cat /sys/fs/cgroup/myrun-<pid>/memory.max   # 67108864
+   cat /sys/fs/cgroup/myrun-<pid>/cpu.max      # 50000 100000
+   cat /sys/fs/cgroup/myrun-<pid>/pids.max     # 100
+   ```
+
+**macOS:** `go build ./...` compiles the darwin stubs for seccomp + userns + ocispec. Parsing a config.json works on macOS too — execution still errors out with the existing "requires Linux" message.
+
 ## Milestones
 - **M1 (done):** PID/MNT/UTS/IPC/NET namespaces + chroot + `mount /proc` + basic `run`
 - **M2 (done):** cgroups v2 resource limits (cpu/mem/pids)
 - **M3 (done):** OverlayFS + OCI image pull from Docker Hub
 - **M4 (done):** Bridge networking (`myrun0`) + veth pairs + iptables DNAT port forwarding
-- **M5:** Seccomp profiles + rootless + full OCI spec compliance · USER namespace · pivot_root instead of chroot
+- **M5 (done):** Seccomp BPF default profile + rootless user namespaces + OCI runtime spec (`--spec config.json`)
+- **M6 (future):** pivot_root, slirp4netns for rootless networking, CRIU checkpoint/restore, AppArmor profiles
 
 ## Key References
 - OCI Runtime Spec

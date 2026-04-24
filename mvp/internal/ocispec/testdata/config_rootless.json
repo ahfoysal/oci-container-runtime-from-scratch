@@ -1,0 +1,29 @@
+{
+  "ociVersion": "1.1.0",
+  "hostname": "container",
+  "process": {
+    "terminal": false,
+    "user": { "uid": 0, "gid": 0 },
+    "args": ["/bin/sh"],
+    "env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+    "cwd": "/",
+    "noNewPrivileges": true
+  },
+  "root": { "path": "rootfs", "readonly": false },
+  "mounts": [
+    { "destination": "/proc", "type": "proc", "source": "proc" }
+  ],
+  "linux": {
+    "namespaces": [
+      { "type": "pid" },
+      { "type": "mount" },
+      { "type": "uts" },
+      { "type": "ipc" },
+      { "type": "network" },
+      { "type": "user" }
+    ],
+    "uidMappings": [{ "containerID": 0, "hostID": 1000, "size": 1 }],
+    "gidMappings": [{ "containerID": 0, "hostID": 1000, "size": 1 }],
+    "seccomp":     { "defaultAction": "SCMP_ACT_ERRNO" }
+  }
+}

@@ -27,7 +27,9 @@ import (
 	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/cgroups"
 	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/image"
 	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/network"
+	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/ocispec"
 	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/runtime"
+	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/userns"
 )
 
 // defaultStoreRoot is the on-disk location for pulled images + container
@@ -189,12 +191,31 @@ func runCmd(argv []string) error {
 	pids := fs.Int64("pids", 0, "max PIDs in container")
 	var publish publishFlag
 	fs.Var(&publish, "publish", "publish host:container[/proto] (repeatable)")
+	// M5 flags. --rootless forces user-namespace mode even when invoked
+	// as root (useful for testing); when myrun is invoked non-root, the
+	// runtime auto-enables rootless via userns.Detect unless the user
+	// explicitly sets --rootless=false. --no-seccomp disables the
+	// default profile (debug only). --spec loads an OCI config.json.
+	rootless := fs.Bool("rootless", false, "run in user-namespace rootless mode (auto-enabled when not real-root)")
+	noSeccomp := fs.Bool("no-seccomp", false, "disable the default seccomp profile (NOT recommended)")
+	specPath := fs.String("spec", "", "path to OCI runtime spec (config.json or dir containing it)")
 	if err := fs.Parse(argv); err != nil {
 		return err
 	}
-	if fs.NArg() < 2 {
+
+	var spec *ocispec.Spec
+	if *specPath != "" {
+		s, err := ocispec.Load(*specPath)
+		if err != nil {
+			return err
+		}
+		spec = s
+	}
+
+	// When --spec supplies rootfs/cmd we relax the positional requirements.
+	if spec == nil && fs.NArg() < 2 {
 		usage()
-		return fmt.Errorf("run requires <rootfs-or-image> and <cmd>")
+		return fmt.Errorf("run requires <rootfs-or-image> and <cmd> (or --spec)")
 	}
 
 	memBytes, err := parseMemory(*memStr)
@@ -202,10 +223,21 @@ func runCmd(argv []string) error {
 		return err
 	}
 
+	rootfs := ""
+	cmdName := ""
+	var cmdArgs []string
+	if fs.NArg() >= 1 {
+		rootfs = fs.Arg(0)
+	}
+	if fs.NArg() >= 2 {
+		cmdName = fs.Arg(1)
+		cmdArgs = fs.Args()[2:]
+	}
+
 	cfg := runtime.Config{
-		Rootfs: fs.Arg(0),
-		Cmd:    fs.Arg(1),
-		Args:   fs.Args()[2:],
+		Rootfs: rootfs,
+		Cmd:    cmdName,
+		Args:   cmdArgs,
 		Limits: cgroups.Limits{
 			MemoryBytes: memBytes,
 			CPUQuota:    *cpu,
@@ -213,6 +245,9 @@ func runCmd(argv []string) error {
 		},
 		StoreRoot:    storeRoot(),
 		PortMappings: []network.PortMapping(publish),
+		Rootless:     userns.Detect(*rootless),
+		Seccomp:      !*noSeccomp,
+		Spec:         spec,
 	}
 	return runtime.Run(cfg)
 }
@@ -240,14 +275,19 @@ func main() {
 		// cmd. The parent has already placed us into a cgroup (if any) and
 		// prepared the rootfs (possibly an overlay mount) before releasing
 		// the sync pipe we block on inside Child.
-		if len(os.Args) < 4 {
+		// M5: the re-exec argv now carries a seccomp flag between the
+		// "child" marker and the rootfs, so the child can decide whether
+		// to install the default profile before exec. Layout:
+		//   child <seccomp=0|1> <rootfs> <cmd> [args...]
+		if len(os.Args) < 5 {
 			usage()
 			os.Exit(2)
 		}
-		rootfs := os.Args[2]
-		cmd := os.Args[3]
-		args := os.Args[4:]
-		if err := runtime.Child(rootfs, cmd, args); err != nil {
+		seccompEnabled := os.Args[2] == "seccomp=1"
+		rootfs := os.Args[3]
+		cmd := os.Args[4]
+		args := os.Args[5:]
+		if err := runtime.Child(rootfs, cmd, args, seccompEnabled); err != nil {
 			fmt.Fprintf(os.Stderr, "myrun: child failed: %v\n", err)
 			os.Exit(1)
 		}
