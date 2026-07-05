@@ -16,7 +16,7 @@ import (
 	"github.com/ahfoysal/oci-container-runtime-from-scratch/mvp/internal/userns"
 )
 
-var errDarwinUnsupported = errors.New("myrun runtime requires Linux (namespaces + chroot). Run inside a Linux VM — see mvp/README")
+var errDarwinUnsupported = errors.New("myrun runtime requires Linux (namespaces + chroot). Run inside a Linux VM — see README")
 
 // Config mirrors the Linux struct so main.go needs no build-tag branches.
 type Config struct {
